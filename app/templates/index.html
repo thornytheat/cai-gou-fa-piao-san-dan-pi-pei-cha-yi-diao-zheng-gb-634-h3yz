@@ -1,0 +1,135 @@
+{% extends "base.html" %}
+{% block title %}导入与诊断{% endblock %}
+{% block body %}
+
+<section class="panel">
+  <div class="panel-head">
+    <h2>样例文件</h2>
+    <span class="sub">{{ samples|length }} 个 · 默认 {{ defaults|length }} 个</span>
+  </div>
+  <div class="toolbar">
+    <button class="btn" id="run-import" data-url="/api/import">导入</button>
+    <button class="btn ghost" id="reload-samples" data-url="/api/samples">刷新清单</button>
+    <span class="toast" id="import-status" role="status"></span>
+  </div>
+  <div class="scroll-x">
+    <table class="grid" id="samples-table">
+      <thead>
+        <tr><th>选</th><th>文件</th><th>单据</th><th>字节</th><th>摘要</th><th>说明</th></tr>
+      </thead>
+      <tbody>
+        {% for item in samples %}
+        <tr>
+          <td><input type="checkbox" name="sample" value="{{ item.name }}"
+                     {{ 'checked' if item.name in defaults else '' }}></td>
+          <td class="mono">{{ item.name }}</td>
+          <td>{{ item.doc_label }}</td>
+          <td class="num">{{ item.bytes|num }}</td>
+          <td class="mono">{{ item.sha256 }}</td>
+          <td class="muted">{{ item.note }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+
+{% if batch %}
+<section class="panel">
+  <div class="panel-head">
+    <h2>阶段诊断</h2>
+    <span class="sub">{{ stages|length }} 段 · 隔离 {{ quality.quarantined if quality else 0 }} 行</span>
+  </div>
+  <table class="grid">
+    <thead>
+      <tr><th>阶段</th><th>进</th><th>出</th><th>隔离</th><th>状态</th><th>说明</th></tr>
+    </thead>
+    <tbody>
+      {% for row in stages %}
+      <tr>
+        <td>{{ row.stage|stage }}</td>
+        <td class="num">{{ row.in_count }}</td>
+        <td class="num">{{ row.out_count }}</td>
+        <td class="num">{{ row.quarantine_count }}</td>
+        <td><span class="tag {{ 'ok' if row.status == 'ok' else 'warn' }}">{{ '正常' if row.status == 'ok' else row.status }}</span></td>
+        <td class="muted">{{ row.note }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</section>
+
+<section class="panel">
+  <div class="panel-head">
+    <h2>文件诊断</h2>
+    <span class="sub">{{ files|length }} 个文件</span>
+  </div>
+  <div class="scroll-x">
+    <table class="grid">
+      <thead>
+        <tr><th>文件</th><th>单据</th><th>状态</th><th>实际编码</th><th>声明编码</th>
+            <th>BOM</th><th>记录</th><th>采纳</th><th>隔离</th><th>分段</th><th>原因码</th></tr>
+      </thead>
+      <tbody>
+        {% for row in files %}
+        <tr>
+          <td class="mono">{{ row.name }}</td>
+          <td>{{ row.doc_type|doc }}</td>
+          <td><span class="tag {{ 'ok' if row.status == 'done' else 'warn' }}">{{ row.status|status }}</span></td>
+          <td class="mono">{{ row.encoding or '—' }}</td>
+          <td class="mono">{{ row.declared_charset or '—' }}</td>
+          <td class="mono">{{ '是' if row.bom_stripped else '否' }}</td>
+          <td class="num">{{ row.record_count }}</td>
+          <td class="num">{{ row.accept_count }}</td>
+          <td class="num">{{ row.quarantine_count }}</td>
+          <td class="num">{{ row.segment_count }}</td>
+          <td class="mono">{{ row.code or '—' }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<section class="panel two-col">
+  <div>
+    <div class="panel-head"><h2>原因码分布</h2><span class="sub">{{ distribution|length }} 类</span></div>
+    <div class="bars">
+      {% for item in distribution %}
+      <div class="bar-row">
+        <span class="mono">{{ item.code }}</span>
+        <span class="bar-track">
+          <span class="bar-fill {{ 'bad' if item.level == 'error' else ('warn' if item.level == 'warn' else 'ok') }}"
+                style="width: {{ (item.count * 100 // distribution[0].count) if distribution[0].count else 0 }}%"></span>
+        </span>
+        <span class="bar-count">{{ item.count }}</span>
+      </div>
+      {% endfor %}
+    </div>
+  </div>
+  <div>
+    <div class="panel-head"><h2>逐行诊断</h2><span class="sub">前 {{ quarantine_rows|length }} 行</span></div>
+    <div class="scroll-x">
+      <table class="grid">
+        <thead><tr><th>原因码</th><th>级别</th><th>文件</th><th>行号</th><th>字段</th><th>原值</th></tr></thead>
+        <tbody>
+          {% for row in quarantine_rows %}
+          <tr>
+            <td class="mono">{{ row.code }}</td>
+            <td><span class="tag {{ 'bad' if row.level == 'error' else ('warn' if row.level == 'warn' else 'info') }}">{{ row.level|level }}</span></td>
+            <td class="mono">{{ row.file_name or '—' }}</td>
+            <td class="mono">{{ row.row_ref or '—' }}</td>
+            <td class="mono">{{ row.field or '—' }}</td>
+            <td class="mono">{{ row.raw_value or '—' }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+</section>
+{% else %}
+<p class="empty">还没有运行批次。</p>
+{% endif %}
+
+{% endblock %}

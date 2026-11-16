@@ -1,0 +1,23 @@
+services:
+  app:
+    build: .
+    image: invoice3way:local
+    environment:
+      INVOICE3WAY_DB: /data/invoice3way.sqlite
+      INVOICE3WAY_SAMPLES: /app/sample_data
+      INVOICE3WAY_EXPORT: /data/export
+      EVAL_DATE: "2026-11-15"
+      TZ: Asia/Shanghai
+    ports:
+      - "18203:8000"
+    volumes:
+      - invoice3way-data:/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import httpx; httpx.get('http://127.0.0.1:8000/healthz', timeout=2.0)"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 5s
+
+volumes:
+  invoice3way-data:

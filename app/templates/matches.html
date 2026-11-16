@@ -1,0 +1,84 @@
+{% extends "base.html" %}
+{% block title %}三单对照{% endblock %}
+{% block body %}
+
+<section class="panel">
+  <div class="panel-head">
+    <h2>三单对照</h2>
+    <span class="sub">PO {{ po_total }} · GRN {{ grn_total }} · INV {{ inv_total }}</span>
+  </div>
+  <div class="toolbar">
+    <div class="link-row" id="verdict-filter" data-base="/matches">
+      <a href="/matches" class="{{ 'on' if not verdict else '' }}">全部</a>
+      <a href="/matches?verdict=matched" class="{{ 'on' if verdict == 'matched' else '' }}">匹配</a>
+      <a href="/matches?verdict=diff" class="{{ 'on' if verdict == 'diff' else '' }}">差异</a>
+      <a href="/matches?verdict=missing" class="{{ 'on' if verdict == 'missing' else '' }}">缺单</a>
+    </div>
+    <span class="toast" id="match-status" role="status"></span>
+  </div>
+
+  <div class="split">
+    <div class="panel-head"><h2 class="faint">采购订单 / 入库单</h2></div>
+    <div class="panel-head"><h2 class="faint">差异</h2></div>
+    <div class="panel-head"><h2 class="faint">发票</h2></div>
+  </div>
+
+  {% if rows %}
+  <div class="rows" id="match-rows">
+    {% for row in rows %}
+    <div class="crow {{ 'is-diff' if row.verdict == 'diff' else ('is-missing' if row.verdict == 'missing' else '') }}"
+         data-verdict="{{ row.verdict }}" data-key="{{ row.key }}">
+      <div class="cell">
+        <div class="line">
+          <span class="k">{{ row.po_no }} · {{ row.line_no }}</span>
+          <span class="tag {{ 'ok' if row.verdict == 'matched' else ('warn' if row.verdict == 'diff' else 'bad') }}">{{ row.verdict_label }}</span>
+        </div>
+        {% if row.po.missing %}
+        <div class="missing-note">{{ row.po.text }}</div>
+        {% else %}
+        <div class="line"><span class="name">{{ row.po.item_name }}</span>
+          <span class="v">{{ row.po.qty }} × {{ row.po.unit_price }}</span></div>
+        <div class="line"><span class="name">税率 {{ row.po.tax_rate }}</span>
+          <span class="mono faint">{{ row.po.row_ref }}</span></div>
+        {% endif %}
+        {% if row.grn.missing %}
+        <div class="missing-note">{{ row.grn.text }}</div>
+        {% else %}
+        <div class="line"><span class="name">入库 {{ row.grn.grn_no }}</span>
+          <span class="v">{{ row.grn.qty }}</span></div>
+        <div class="line"><span class="name">{{ row.grn.received_at }}</span>
+          <span class="mono faint">{{ row.grn.row_ref }}</span></div>
+        {% endif %}
+      </div>
+
+      <div class="marker">
+        {% if row.verdict == 'matched' %}
+        <span>差异 0</span><b>匹配</b>
+        {% else %}
+        <span>{{ row.diff_label or '缺单' }}</span>
+        <b>{{ '—' if row.verdict == 'missing' else row.diff_amount }}</b>
+        {% endif %}
+      </div>
+
+      <div class="cell">
+        {% if row.inv.missing %}
+        <div class="missing-note">{{ row.inv.text }}</div>
+        {% else %}
+        <div class="line"><span class="k">{{ row.inv.invoice_no }}</span>
+          <span class="v">{{ row.inv.amount_inc }}</span></div>
+        <div class="line"><span class="name">不含税 {{ row.inv.amount_ex }}</span>
+          <span class="v">数量 {{ row.inv.qty }}</span></div>
+        <div class="line"><span class="name">应付 {{ row.explain.expect_amount_inc or '—' }}</span>
+          <span class="mono faint">{{ row.inv.row_ref }}</span></div>
+        {% endif %}
+      </div>
+    </div>
+    {% endfor %}
+  </div>
+  {% else %}
+  <p class="empty">这一筛选项下没有行。</p>
+  {% endif %}
+</section>
+
+{% endblock %}
+{% block scripts %}<script src="/static/match.js"></script>{% endblock %}

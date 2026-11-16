@@ -1,0 +1,254 @@
+{% extends "base.html" %}
+{% block title %}复核台账{% endblock %}
+{% block body %}
+
+<section class="panel">
+  <div class="panel-head">
+    <h2>守恒检查</h2>
+    <span class="sub">{{ checks|length }} 账 · {{ '全平' if balanced else '有差额' }}</span>
+  </div>
+  <div class="accounts">
+    {% for row in checks %}
+    <div class="acct {{ 'ok' if row.balanced else 'bad' }}">
+      <span class="label">{{ row.label }}</span>
+      <span class="side"><span>{{ row.left_label }}</span><b class="v">{{ row.left }}</b></span>
+      <span class="op">=</span>
+      <span class="side"><span>{{ row.right_label }}</span><b class="v">{{ row.right }}</b></span>
+      <span class="delta {{ 'neg' if not row.balanced else '' }}">{{ row.diff }}</span>
+      <span class="tag {{ 'ok' if row.balanced else 'bad' }}">{{ '平' if row.balanced else '不平' }}</span>
+    </div>
+    {% endfor %}
+  </div>
+</section>
+
+<section class="panel">
+  <div class="panel-head">
+    <h2>供应商汇总</h2>
+    <span class="sub">{{ supplier_totals.suppliers or 0 }} 家 · 净额 {{ supplier_totals.net or '0.00' }} {{ money_unit }}</span>
+  </div>
+  <div class="toolbar">
+    <span class="hintline">主数据 {{ master.rows or 0 }} 行 · 已登记 {{ master.po_registered or 0 }} 个采购单 · 未登记 {{ supplier_totals.unknown or 0 }} 家</span>
+    <span class="hintline">红冲 {{ supplier_totals.red_total or '0.00' }} · 待确认 {{ supplier_totals.red_pending or '0.00' }}</span>
+  </div>
+  <div class="scroll-x">
+    <table class="grid">
+      <thead>
+        <tr><th>供应商</th><th>编码</th><th>状态</th><th>采购单</th><th>采购行</th>
+            <th>入库行</th><th>无订单</th><th>发票行</th><th>发票含税({{ money_unit }})</th>
+            <th>红冲({{ money_unit }})</th><th>净额({{ money_unit }})</th>
+            <th>差异({{ money_unit }})</th><th>调整额({{ money_unit }})</th>
+            <th>税率变更</th></tr>
+      </thead>
+      <tbody>
+        {% for row in suppliers %}
+        <tr>
+          <td>{{ row.supplier_name }}</td>
+          <td class="mono">{{ row.supplier_code }}</td>
+          <td>
+            {% if row.supplier_name == '未登记' %}
+            <span class="tag warn">未登记</span>
+            {% elif row.suspended %}
+            <span class="tag bad">停用</span>
+            {% else %}
+            <span class="tag ok">正常</span>
+            {% endif %}
+          </td>
+          <td class="mono faint">{{ row.po_nos }}</td>
+          <td class="num">{{ row.po_lines }}</td>
+          <td class="num">{{ row.grn_lines }}</td>
+          <td class="num">{{ row.orphan }}</td>
+          <td class="num">{{ row.inv_lines }}</td>
+          <td class="num">{{ row.inv_inc }}</td>
+          <td class="num {{ 'neg' if row.red_total != '0.00' else '' }}">{{ row.red_total }}</td>
+          <td class="num"><b>{{ row.net }}</b></td>
+          <td class="num">{{ row.diff_total }}</td>
+          <td class="num">{{ row.adjust_total }}</td>
+          <td class="num">{{ row.rate_shift }}</td>
+        </tr>
+        {% else %}
+        <tr><td colspan="14"><div class="empty">还没有批次。</div></td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<section class="panel two-col">
+  <div>
+    <div class="panel-head">
+      <h2>重复发票组</h2>
+      <span class="sub">{{ dup_counts.groups or 0 }} 组 · 明细 {{ dup_groups|length }} 行</span>
+    </div>
+    <div class="toolbar">
+      <div class="link-row">
+        <a href="/audit" class="{{ 'on' if not dup_kind else '' }}">全部</a>
+        {% for item in dup_kinds %}
+        <a href="/audit?kind={{ item.key }}" class="{{ 'on' if dup_kind == item.key else '' }}">{{ item.label }} {{ item.count }}</a>
+        {% endfor %}
+      </div>
+    </div>
+    <div class="scroll-x">
+      <table class="grid">
+        <thead><tr><th>类型</th><th>键</th><th>批次</th><th>行</th><th>明细</th></tr></thead>
+        <tbody>
+          {% for group in dup_groups %}
+          <tr>
+            <td><span class="tag warn">{{ group.label }}</span></td>
+            <td class="mono">{{ group.key }}</td>
+            <td class="num">{{ group.batches }}</td>
+            <td class="num">{{ group.count }}</td>
+            <td class="mono faint">
+              {% for item in group.rows %}
+              <div>{{ item.batch_id }} · {{ item.invoice_no }} · {{ item.amount_inc }} · {{ item.row_ref }}</div>
+              {% endfor %}
+            </td>
+          </tr>
+          {% else %}
+          <tr><td colspan="5"><div class="empty">只有一批，没有可比记录。</div></td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <div>
+    <div class="panel-head">
+      <h2>红字发票</h2>
+      <span class="sub">{{ credits.totals.rows or 0 }} 行 · 已冲抵 {{ credits.totals.accepted_total or '0.00' }} {{ money_unit }}</span>
+    </div>
+    <div class="toolbar">
+      <span class="hintline">{{ credits.file or '红字清单' }}{{ ' · ' ~ credits.encoding if credits.encoding else '' }}</span>
+      <span class="toast {{ 'bad' if credits.rejected else '' }}">拒绝 {{ credits.rejected|length }} 行</span>
+    </div>
+    <div class="scroll-x">
+      <table class="grid">
+        <thead><tr><th>红字单</th><th>原发票</th><th>价税合计</th><th>状态</th>
+            <th>剩余可冲</th><th>依据</th><th>证据行</th></tr></thead>
+        <tbody>
+          {% for row in credits.rows %}
+          <tr>
+            <td class="mono">{{ row.credit_no }}</td>
+            <td class="mono">{{ row.original_no }}</td>
+            <td class="num neg">{{ row.amount_inc }}</td>
+            <td>
+              {% if row.status == '全额冲抵' %}<span class="tag ok">{{ row.status }}</span>
+              {% elif row.status == '部分冲红' %}<span class="tag warn">{{ row.status }}</span>
+              {% elif row.status == '超额冲抵' %}<span class="tag bad">{{ row.status }}</span>
+              {% else %}<span class="tag bad">{{ row.status }}</span>{% endif %}
+            </td>
+            <td class="num">{{ row.remaining }}</td>
+            <td class="mono faint">{{ row.code or '—' }}</td>
+            <td class="mono faint">{{ row.row_ref }}</td>
+          </tr>
+          {% else %}
+          <tr><td colspan="7"><div class="empty">本批没有红字发票。</div></td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    {% if credits.rejected %}
+    <div class="panel-head"><h3 class="sub">被拒绝的红字行</h3><span class="sub">{{ credits.rejected|length }} 行</span></div>
+    <table class="grid">
+      <thead><tr><th>原因码</th><th>字段</th><th>原值</th><th>证据行</th></tr></thead>
+      <tbody>
+        {% for item in credits.rejected %}
+        {% for issue in item.issues %}
+        <tr>
+          <td><span class="tag {{ issue.level == 'error' and 'bad' or ('warn' if issue.level == 'warn' else 'info') }}">{{ issue.code }}</span></td>
+          <td class="mono">{{ issue.field or '—' }}</td>
+          <td class="mono">{{ issue.raw_value or '—' }}</td>
+          <td class="mono faint">{{ item.row_ref }}</td>
+        </tr>
+        {% endfor %}
+        {% endfor %}
+      </tbody>
+    </table>
+    {% endif %}
+  </div>
+</section>
+
+<section class="panel two-col">
+  <div>
+    <div class="panel-head">
+      <h2>分批入库</h2>
+      <span class="sub">{{ grn_splits|length }} 个采购行 · 实收 {{ supplier_totals.received or '0' }}</span>
+    </div>
+    <div class="scroll-x">
+      <table class="grid">
+        <thead><tr><th>采购单</th><th>行</th><th>订单</th><th>分批</th><th>实收</th>
+            <th>未入库</th><th>状态</th></tr></thead>
+        <tbody>
+          {% for row in grn_splits %}
+          <tr>
+            <td class="mono">{{ row.po_no }}</td>
+            <td class="mono">{{ row.line_no }}</td>
+            <td class="num">{{ row.ordered }}</td>
+            <td class="mono faint">
+              {% for batch in row.batches %}
+              <div>{{ batch.grn_no }} {{ batch.qty }} · {{ batch.received_at }}</div>
+              {% else %}
+              <div>未入库</div>
+              {% endfor %}
+            </td>
+            <td class="num">{{ row.received }}</td>
+            <td class="num {{ 'neg' if row.remaining != '0' else '' }}">{{ row.remaining }}</td>
+            <td>
+              {% if row.over %}<span class="tag bad">超收</span>
+              {% elif row.batch_count > 1 %}<span class="tag info">{{ row.batch_count }} 批</span>
+              {% elif row.remaining == '0' %}<span class="tag ok">齐</span>
+              {% else %}<span class="tag warn">部分</span>{% endif %}
+            </td>
+          </tr>
+          {% else %}
+          <tr><td colspan="7"><div class="empty">本批没有采购行。</div></td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <div>
+    <div class="panel-head">
+      <h2>税率变更</h2>
+      <span class="sub">{{ rate_shifts|length }} 行 · 迁移额 {{ supplier_totals.rate_moved or '0.00' }} {{ money_unit }}</span>
+    </div>
+    <div class="scroll-x">
+      <table class="grid">
+        <thead><tr><th>采购单</th><th>行</th><th>发票号</th><th>采购税率</th>
+            <th>发票税率</th><th>按发票税率</th><th>差额</th></tr></thead>
+        <tbody>
+          {% for row in rate_shifts %}
+          <tr>
+            <td class="mono">{{ row.po_no }}</td>
+            <td class="mono">{{ row.line_no }}</td>
+            <td class="mono">{{ row.invoice_no }}</td>
+            <td class="num">{{ row.po_rate }}</td>
+            <td class="num">{{ row.inv_rate }}</td>
+            <td class="num">{{ row.inc_by_invoice_rate }}</td>
+            <td class="num">{{ row.moved_amount }}</td>
+          </tr>
+          {% else %}
+          <tr><td colspan="7"><div class="empty">本批发票税率与采购单一致。</div></td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    {% if master.issues %}
+    <div class="panel-head"><h3 class="sub">主数据提示</h3><span class="sub">{{ master.issues|length }} 条</span></div>
+    <table class="grid">
+      <thead><tr><th>原因码</th><th>采购单</th><th>说明</th></tr></thead>
+      <tbody>
+        {% for issue in master.issues %}
+        <tr>
+          <td><span class="tag warn">{{ issue.code }}</span></td>
+          <td class="mono">{{ issue.po_no or '—' }}</td>
+          <td>{{ issue.detail or issue.title }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    {% endif %}
+  </div>
+</section>
+
+{% endblock %}

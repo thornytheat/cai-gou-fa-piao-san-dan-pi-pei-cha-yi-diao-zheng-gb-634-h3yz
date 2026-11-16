@@ -1,0 +1,79 @@
+{% extends "base.html" %}
+{% block title %}差异明细{% endblock %}
+{% block body %}
+
+<section class="panel">
+  <div class="panel-head">
+    <h2>差异明细</h2>
+    <span class="sub">{{ rows|length }} 行 · 调整额 {{ totals.adjust_total or '0.00' }} {{ money_unit }}</span>
+  </div>
+  <div class="toolbar">
+    <div class="link-row" data-base="/diffs">
+      <a href="/diffs" class="{{ 'on' if not kind else '' }}">全部</a>
+      {% for k in ['qty', 'price', 'tax'] %}
+      <a href="/diffs?kind={{ k }}" class="{{ 'on' if kind == k else '' }}">{{ diff_labels[k] }}</a>
+      {% endfor %}
+    </div>
+    <span class="toast" id="diff-status" role="status"></span>
+  </div>
+
+  <div class="scroll-x">
+    <table class="grid">
+      <thead>
+        <tr><th>采购单</th><th>行</th><th>类别</th><th>量差</th><th>价差</th>
+            <th>税额差</th><th>调整额</th><th>证据行</th></tr>
+      </thead>
+      <tbody>
+        {% for row in rows %}
+        <tr>
+          <td class="mono">{{ row.po_no }}</td>
+          <td class="mono">{{ row.line_no }}</td>
+          <td><span class="tag warn">{{ row.diff_label }}</span></td>
+          <td class="num">{{ row.parts|selectattr('kind', 'equalto', 'qty')|map(attribute='value')|first or '—' }}</td>
+          <td class="num">{{ row.parts|selectattr('kind', 'equalto', 'price')|map(attribute='value')|first or '—' }}</td>
+          <td class="num">{{ row.parts|selectattr('kind', 'equalto', 'tax')|map(attribute='value')|first or '—' }}</td>
+          <td class="num">{{ row.diff_amount }}</td>
+          <td class="mono faint">{{ row.evidence }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<section class="panel two-col">
+  <div>
+    <div class="panel-head"><h2>缺单</h2><span class="sub">{{ missing|length }} 行</span></div>
+    <table class="grid">
+      <thead><tr><th>采购单</th><th>行</th><th>缺哪张</th><th>证据行</th></tr></thead>
+      <tbody>
+        {% for row in missing %}
+        <tr>
+          <td class="mono">{{ row.po_no }}</td>
+          <td class="mono">{{ row.line_no }}</td>
+          <td><span class="tag bad">{{ row.diff_label }}</span></td>
+          <td class="mono faint">{{ row.evidence }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  <div>
+    <div class="panel-head"><h2>按类别合计</h2><span class="sub">{{ by_kind|length }} 类</span></div>
+    <table class="grid">
+      <thead><tr><th>类别</th><th>行数</th><th>调整额</th></tr></thead>
+      <tbody>
+        {% for row in by_kind %}
+        <tr>
+          <td>{{ row.label }}</td>
+          <td class="num">{{ row.count }}</td>
+          <td class="num">{{ row.amount }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+
+{% endblock %}
+{% block scripts %}<script src="/static/match.js"></script>{% endblock %}

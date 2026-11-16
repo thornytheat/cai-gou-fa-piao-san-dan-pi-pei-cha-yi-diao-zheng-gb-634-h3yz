@@ -1,0 +1,76 @@
+{% extends "base.html" %}
+{% block title %}导出{% endblock %}
+{% block body %}
+
+<section class="panel">
+  <div class="panel-head">
+    <h2>四账</h2>
+    <span class="sub">{{ '平' if reconcile and reconcile.balanced else '不平' }}</span>
+  </div>
+  {% if reconcile %}
+  <div class="accounts">
+    {% for row in reconcile.accounts %}
+    <div class="acct {{ 'ok' if row.balanced else 'bad' }}">
+      <span class="label">{{ row.label }}</span>
+      <span class="side"><span>{{ row.left_label }}</span><span class="num">{{ row.left }}</span></span>
+      <span class="op">{{ '=' if row.balanced else '≠' }}</span>
+      <span class="side"><span>{{ row.right_label }}</span><span class="num">{{ row.right }}</span></span>
+      <span class="num delta {{ 'pos' if row.balanced else 'neg' }}">差额 {{ row.diff }}</span>
+      <span class="tag {{ 'ok' if row.balanced else 'bad' }}">{{ '平' if row.balanced else '不平' }}</span>
+    </div>
+    {% endfor %}
+  </div>
+  {% else %}
+  <p class="empty">还没有运行批次。</p>
+  {% endif %}
+</section>
+
+<section class="panel two-col">
+  <div>
+    <div class="panel-head"><h2>下载</h2><span class="sub">{{ kinds|length }} 种</span></div>
+    <div class="link-row" id="export-links">
+      {% for item in kinds %}
+      <a href="/api/export/download?kind={{ item.key }}">{{ item.label }}</a>
+      {% endfor %}
+    </div>
+    <p class="hintline" id="export-status" role="status"></p>
+  </div>
+  <div>
+    <div class="panel-head"><h2>金额合计</h2><span class="sub">{{ run_id or '—' }}</span></div>
+    <table class="grid">
+      <thead><tr><th>项</th><th>金额</th></tr></thead>
+      <tbody>
+        <tr><td>匹配合计</td><td class="num">{{ totals.matched_total or '0.00' }}</td></tr>
+        <tr><td>差异合计</td><td class="num">{{ totals.diff_total or '0.00' }}</td></tr>
+        <tr><td>缺单合计</td><td class="num">{{ totals.missing_total or '0.00' }}</td></tr>
+        <tr><td>调整额</td><td class="num">{{ totals.adjust_total or '0.00' }}</td></tr>
+        <tr><td>已分摊</td><td class="num">{{ adjust_summary.allocated or '0.00' }}</td></tr>
+        <tr><td>尾差</td><td class="num">{{ adjust_summary.remainder or '0.00' }}</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<section class="panel">
+  <div class="panel-head"><h2>输入摘要</h2><span class="sub">{{ manifest_inputs|length }} 个文件</span></div>
+  <div class="scroll-x">
+    <table class="grid">
+      <thead><tr><th>文件</th><th>单据</th><th>字节</th><th>记录</th><th>编码</th><th>sha256</th></tr></thead>
+      <tbody>
+        {% for row in manifest_inputs %}
+        <tr>
+          <td class="mono">{{ row.name }}</td>
+          <td>{{ row.doc_label }}</td>
+          <td class="num">{{ row.bytes }}</td>
+          <td class="num">{{ row.records }}</td>
+          <td class="mono">{{ row.encoding }}</td>
+          <td class="mono faint" data-sha="{{ row.sha256 }}">{{ row.sha256 }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+
+{% endblock %}
+{% block scripts %}<script src="/static/export.js"></script>{% endblock %}

@@ -1,0 +1,86 @@
+{% extends "base.html" %}
+{% block title %}调整单{% endblock %}
+{% block body %}
+
+<section class="panel">
+  <div class="panel-head">
+    <h2>调整单</h2>
+    <span class="sub">{{ adjustments|length }} 行 · 合计 {{ adjust_summary.total or '0.00' }} {{ money_unit }}</span>
+  </div>
+  <div class="toolbar">
+    <a class="btn ghost" href="/api/export/download?kind=adjustment">下载 CSV</a>
+    <span class="hintline">已分 {{ adjust_summary.allocated or '0.00' }} · 尾差 {{ adjust_summary.remainder or '0.00' }}</span>
+  </div>
+  <table class="grid">
+    <thead>
+      <tr><th>调整单号</th><th>采购单</th><th>类别</th><th>权重金额</th>
+          <th>调整金额</th><th>证据行</th></tr>
+    </thead>
+    <tbody>
+      {% for row in adjustments %}
+      <tr>
+        <td class="mono">{{ row.adj_no }}</td>
+        <td class="mono">{{ row.po_no }}</td>
+        <td>{{ row.diff_kind|diff_label }}</td>
+        <td class="num">{{ row.weight|money }}</td>
+        <td class="num">{{ row.alloc_amount|money }}</td>
+        <td class="mono faint">{{ row.evidence|join(' ') }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</section>
+
+<section class="panel two-col">
+  <div>
+    <div class="panel-head"><h2>分摊依据</h2><span class="sub">{{ diff_lines|length }} 条差异</span></div>
+    <table class="grid">
+      <thead><tr><th>采购单</th><th>行</th><th>类别</th><th>差异金额</th></tr></thead>
+      <tbody>
+        {% for row in diff_lines %}
+        <tr>
+          <td class="mono">{{ row.po_no }}</td>
+          <td class="mono">{{ row.line_no }}</td>
+          <td><span class="tag warn">{{ row.diff_label }}</span></td>
+          <td class="num">{{ row.diff_amount }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  <div>
+    <div class="panel-head"><h2>运行清单</h2><span class="sub">{{ run_id or '—' }}</span></div>
+    <table class="grid">
+      <thead><tr><th>字段</th><th>值</th></tr></thead>
+      <tbody>
+        {% for row in manifest_rows %}
+        <tr><td>{{ row.label }}</td><td class="mono">{{ row.value }}</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<section class="panel">
+  <div class="panel-head"><h2>输入摘要</h2><span class="sub">{{ manifest_inputs|length }} 个文件</span></div>
+  <div class="scroll-x">
+    <table class="grid">
+      <thead><tr><th>文件</th><th>单据</th><th>字节</th><th>记录</th><th>编码</th><th>sha256</th></tr></thead>
+      <tbody>
+        {% for row in manifest_inputs %}
+        <tr>
+          <td class="mono">{{ row.name }}</td>
+          <td>{{ row.doc_label }}</td>
+          <td class="num">{{ row.bytes }}</td>
+          <td class="num">{{ row.records }}</td>
+          <td class="mono">{{ row.encoding }}</td>
+          <td class="mono faint">{{ row.sha256 }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+
+{% endblock %}
+{% block scripts %}<script src="/static/export.js"></script>{% endblock %}

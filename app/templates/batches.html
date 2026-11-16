@@ -1,0 +1,54 @@
+{% extends "base.html" %}
+{% block title %}批次历史{% endblock %}
+{% block body %}
+
+<section class="panel">
+  <div class="panel-head">
+    <h2>批次历史</h2>
+    <span class="sub">{{ summary.batches }} 个批次 · 记录 {{ summary.records }} 行</span>
+  </div>
+  <div class="toolbar">
+    <span class="hintline">水位 {{ summary.watermark.batch_id or '—' }}</span>
+    <span class="toast" id="rerun-status" role="status"></span>
+  </div>
+  <div class="scroll-x">
+    <table class="grid" id="batch-table">
+      <thead>
+        <tr><th>批次号</th><th>键</th><th>状态</th><th>规则</th><th>记录</th><th>采纳</th>
+            <th>隔离</th><th>匹配</th><th>差异</th><th>缺单</th><th>调整额</th>
+            <th>输入摘要</th><th>完成</th><th>操作</th></tr>
+      </thead>
+      <tbody>
+        {% for row in rows %}
+        <tr>
+          <td class="mono">{{ row.batch_id }}</td>
+          <td class="mono faint">{{ row.batch_key }}</td>
+          <td><span class="tag {{ 'ok' if row.status == 'done' else 'warn' }}">{{ row.status|status }}</span></td>
+          <td class="mono">{{ row.rule_version }}</td>
+          <td class="num">{{ row.records }}</td>
+          <td class="num">{{ row.accepted }}</td>
+          <td class="num">{{ row.quarantined }}</td>
+          <td class="num">{{ row.matched }}</td>
+          <td class="num">{{ row.diff }}</td>
+          <td class="num">{{ row.missing }}</td>
+          <td class="num">{{ row.adjust_total }}</td>
+          <td class="mono faint">{{ row.input_digest }}</td>
+          <td class="mono">{{ row.finished_at|stamp }}</td>
+          <td>
+            <button class="btn ghost rerun" data-batch="{{ row.batch_id }}"
+                    data-url="/api/batches/{{ row.batch_id }}/rerun">重跑</button>
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<section class="panel">
+  <div class="panel-head"><h2>阶段顺序</h2><span class="sub">{{ summary.versions|join(' ') }}</span></div>
+  <p class="hintline">{{ summary.stage_flow }}</p>
+</section>
+
+{% endblock %}
+{% block scripts %}<script src="/static/match.js"></script>{% endblock %}
