@@ -45,7 +45,9 @@ async function rerunBatch(button) {
   state.busy = true;
   const batchId = button.dataset.batch;
   button.disabled = true;
-  setNote("rerun-status", "重跑中");
+  const isRetry = button.classList.contains("retry");
+  const noteId = document.getElementById("detail-status") ? "detail-status" : "rerun-status";
+  setNote(noteId, isRetry ? "重试中" : "重算中");
   try {
     const response = await fetch(button.dataset.url, {
       method: "POST",
@@ -54,12 +56,13 @@ async function rerunBatch(button) {
     });
     const data = await response.json();
     if (!response.ok) {
-      setNote("rerun-status", data.message || "重跑被拒绝", true);
+      setNote(noteId, data.message || "请求被拒绝", true);
       return;
     }
-    setNote("rerun-status", data.same_batch ? `复用 ${data.batch_id}` : `新批次 ${data.batch_id}`);
+    setNote(noteId, data.same_batch ? `复用 ${data.batch_id}` : `新批次 ${data.batch_id}`);
+    window.location.reload();
   } catch (error) {
-    setNote("rerun-status", "网络异常，重跑未完成", true);
+    setNote(noteId, "网络异常，请求未完成", true);
   } finally {
     state.busy = false;
     button.disabled = false;
@@ -68,7 +71,7 @@ async function rerunBatch(button) {
 
 document.addEventListener("DOMContentLoaded", () => {
   bindFilters();
-  const buttons = document.querySelectorAll("button.rerun");
+  const buttons = document.querySelectorAll("button.rerun, button.retry");
   buttons.forEach((button) => {
     button.addEventListener("click", () => rerunBatch(button));
   });

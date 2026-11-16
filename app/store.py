@@ -1,17 +1,30 @@
-"""SQLite 存储：批次、文件诊断、三单行、隔离区、匹配结论、调整单、阶段、合计、清单。
+"""SQLite 存储：批次、留存原件、文件诊断、三单行、隔离区、匹配结论、调整单、阶段、合计、清单。
 
 约定：
 - 金额/数量/税率一律 TEXT（Decimal 字符串），不落 float；
 - 一次运行的所有行在同一事务里「先删后插」，失败整体回滚，不留半批数据；
-- 读取永远按 batch_id 过滤，页面只展示一个批次。
+- 读取永远按 batch_id 过滤，页面只展示一个批次；
+- 采信的原件字节随批次一起落库（`batch_inputs`），重算只认留存副本；
+- 批次先领取（status=running）再跑，结果一次事务写入并置 done，未完成的结果不可见。
 """
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
 import sqlite3
 from contextlib import contextmanager
 from decimal import Decimal
 from pathlib import Path
+
+# 批次新列：老库启动时按需补齐，不要求手工迁移
+BATCH_COLUMNS = {
+    "eval_date": "TEXT NOT NULL DEFAULT ''",
+    "error": "TEXT NOT NULL DEFAULT ''",
+    "claim_token": "TEXT",
+    "claimed_at": "TEXT",
+    "attempts": "INTEGER NOT NULL DEFAULT 0",
+}
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS batches (
@@ -26,9 +39,27 @@ CREATE TABLE IF NOT EXISTS batches (
     input_digest TEXT NOT NULL,
     resume_of TEXT,
     params_json TEXT NOT NULL DEFAULT '{}',
-    note TEXT NOT NULL DEFAULT ''
+    note TEXT NOT NULL DEFAULT '',
+    eval_date TEXT NOT NULL DEFAULT '',
+    error TEXT NOT NULL DEFAULT '',
+    claim_token TEXT,
+    claimed_at TEXT,
+    attempts INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_batch_key ON batches(batch_key, status);
+CREATE TABLE IF NOT EXISTS batch_inputs (
+    batch_id TEXT NOT NULL,
+    name TEXT NOT NULL,
+    doc_type TEXT NOT NULL,
+    sha256 TEXT NOT NULL,
+    bytes INTEGER NOT NULL,
+    blob TEXT NOT NULL,
+    source_path TEXT,
+    stored_at TEXT NOT NULL,
+    ord INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (batch_id, name)
+);
+CREATE INDEX IF NOT EXISTS idx_batch_inputs_sha ON batch_inputs(sha256);
 CREATE TABLE IF NOT EXISTS files (
     batch_id TEXT NOT NULL, name TEXT NOT NULL, doc_type TEXT NOT NULL,
     status TEXT NOT NULL, encoding TEXT, declared_charset TEXT, bom_stripped INTEGER,
@@ -100,6 +131,15 @@ class Store:
         Path(self.path).resolve().parent.mkdir(parents=True, exist_ok=True)
         with self.connect() as conn:
             conn.executescript(SCHEMA)
+            self._migrate(conn)
+
+    @staticmethod
+    def _migrate(conn) -> None:
+        """老库补齐新列；只加列，不改已有数据。"""
+        have = {row["name"] for row in conn.execute("PRAGMA table_info(batches)")}
+        for column, ddl in BATCH_COLUMNS.items():
+            if column not in have:
+                conn.execute(f"ALTER TABLE batches ADD COLUMN {column} {ddl}")
 
     @contextmanager
     def connect(self):
@@ -115,28 +155,21 @@ class Store:
             conn.close()
 
     # ---------------- 批次 ----------------
-    def upsert_batch(self, batch: dict) -> None:
+    def get_batch(self, batch_id: str) -> dict | None:
         with self.connect() as conn:
-            conn.execute(
-                """INSERT INTO batches (batch_id, batch_key, run_id, source, status,
-                        rule_version, created_at, finished_at, input_digest, resume_of,
-                        params_json, note)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
-                   ON CONFLICT(batch_id) DO UPDATE SET
-                     status=excluded.status, finished_at=excluded.finished_at,
-                     input_digest=excluded.input_digest, note=excluded.note,
-                     params_json=excluded.params_json""",
-                (batch["batch_id"], batch["batch_key"], batch["run_id"], batch["source"],
-                 batch["status"], batch["rule_version"], batch["created_at"],
-                 batch.get("finished_at"), batch["input_digest"], batch.get("resume_of"),
-                 json.dumps(batch.get("params", {}), ensure_ascii=False),
-                 batch.get("note", "")))
+            row = conn.execute("SELECT * FROM batches WHERE batch_id=?", (batch_id,)).fetchone()
+        return _batch_dict(row) if row else None
 
-    def find_done_by_key(self, batch_key: str) -> dict | None:
+    def find_done_by_key(self, batch_key: str, rule_version: str | None = None) -> dict | None:
+        """同一批次键下已完成且版本相同的批次；重算复用只看它。"""
+        sql = "SELECT * FROM batches WHERE batch_key=? AND status='done'"
+        args: list = [batch_key]
+        if rule_version is not None:
+            sql += " AND rule_version=?"
+            args.append(rule_version)
+        sql += " ORDER BY created_at DESC, rowid DESC LIMIT 1"
         with self.connect() as conn:
-            row = conn.execute(
-                "SELECT * FROM batches WHERE batch_key=? AND status='done' "
-                "ORDER BY created_at LIMIT 1", (batch_key,)).fetchone()
+            row = conn.execute(sql, tuple(args)).fetchone()
         return _batch_dict(row) if row else None
 
     def latest_done_by_key(self, batch_key: str) -> dict | None:
@@ -146,20 +179,13 @@ class Store:
                 "ORDER BY created_at DESC, rowid DESC LIMIT 1", (batch_key,)).fetchone()
         return _batch_dict(row) if row else None
 
-    def get_batch(self, batch_id: str) -> dict | None:
-        with self.connect() as conn:
-            row = conn.execute("SELECT * FROM batches WHERE batch_id=?", (batch_id,)).fetchone()
-        return _batch_dict(row) if row else None
-
     def latest_batch(self, status: str = "done") -> dict | None:
+        """页面默认批次只认指定状态（默认 done），未完成/失败的运行不露出结果。"""
         with self.connect() as conn:
             row = conn.execute(
                 "SELECT * FROM batches WHERE status=? ORDER BY created_at DESC, rowid DESC LIMIT 1",
                 (status,)).fetchone()
-            if row is None:
-                row = conn.execute(
-                    "SELECT * FROM batches ORDER BY created_at DESC, rowid DESC LIMIT 1").fetchone()
-        return dict(row) if row else None
+        return _batch_dict(row) if row else None
 
     def list_batches(self, limit: int = 40) -> list[dict]:
         with self.connect() as conn:
@@ -168,13 +194,166 @@ class Store:
                 (limit,)).fetchall()
         return [dict(r) for r in rows]
 
+    # ---------------- 批次输入留存 ----------------
+    @staticmethod
+    def _input_row(batch_id: str, item: dict, ord_index: int, stored_at: str) -> tuple:
+        raw = item["bytes"]
+        digest = item.get("sha256") or hashlib.sha256(raw).hexdigest()
+        return (batch_id, item["name"], item["doc_type"], digest, len(raw),
+                base64.b64encode(raw).decode("ascii"), item.get("source_path"),
+                stored_at, ord_index)
+
+    @staticmethod
+    def _store_inputs(conn, batch_id: str, inputs: list[dict], stored_at: str) -> None:
+        conn.execute("DELETE FROM batch_inputs WHERE batch_id=?", (batch_id,))
+        for index, item in enumerate(inputs):
+            conn.execute(
+                """INSERT INTO batch_inputs (batch_id,name,doc_type,sha256,bytes,blob,
+                        source_path,stored_at,ord) VALUES (?,?,?,?,?,?,?,?,?)""",
+                Store._input_row(batch_id, item, index, stored_at))
+
+    def list_inputs(self, batch_id: str) -> list[dict]:
+        """留存原件的元数据（不含字节），批次页据此核对输入依据。"""
+        return self._all(
+            "SELECT batch_id,name,doc_type,sha256,bytes,source_path,stored_at,ord "
+            "FROM batch_inputs WHERE batch_id=? ORDER BY ord, name", (batch_id,))
+
+    def load_input_bytes(self, batch_id: str) -> list[dict]:
+        """重算只读留存副本：返回原始字节，不再碰 sample_dir。"""
+        rows = self._all(
+            "SELECT name,doc_type,sha256,bytes,blob,source_path,stored_at,ord "
+            "FROM batch_inputs WHERE batch_id=? ORDER BY ord, name", (batch_id,))
+        out = []
+        for row in rows:
+            row["bytes"] = base64.b64decode(row.pop("blob"))
+            out.append(row)
+        return out
+
+    def has_inputs(self, batch_id: str) -> bool:
+        with self.connect() as conn:
+            row = conn.execute("SELECT 1 FROM batch_inputs WHERE batch_id=? LIMIT 1",
+                               (batch_id,)).fetchone()
+        return row is not None
+
+    # ---------------- 领取 / 完成 / 失败 ----------------
+    def claim_run(self, *, batch_key: str, rule_version: str, eval_date: str,
+                  candidate_id: str, preferred_id: str | None, run_id: str,
+                  source: str, created_at: str, input_digest: str,
+                  inputs: list[dict], claim_token: str, now: str,
+                  stale_before: str, params: dict | None = None,
+                  resume_of: str | None = None, note: str = "") -> dict:
+        """原子领取：留存原件与 running 批次行在同一事务里写入。
+
+        - 同键同版本已有活跃运行（租约内）→ 不领取，调用方不得重复落账；
+        - 租约已过期的 running（进程中断）→ 接续同一批次号重跑；
+        - 有 preferred_id（失败重试 / 重算来源）→ 复用该批次号与原件；
+        - 否则新建批次。
+        返回 `claimed=True` 表示拿到执行权。
+        """
+        params_json = json.dumps(params or {}, ensure_ascii=False)
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            # 并发窗口兜底：拿到写锁后先看是否已有同键同版本完成批次，
+            # 有就复用，绝不再落一份重复账。
+            finished = conn.execute(
+                "SELECT * FROM batches WHERE batch_key=? AND rule_version=? "
+                "AND status='done' ORDER BY created_at DESC, rowid DESC LIMIT 1",
+                (batch_key, rule_version)).fetchone()
+            if finished is not None:
+                return {"claimed": False, "reason": "done",
+                        "batch": _batch_dict(finished)}
+            running = conn.execute(
+                "SELECT * FROM batches WHERE batch_key=? AND rule_version=? "
+                "AND status='running' ORDER BY claimed_at DESC, rowid DESC LIMIT 1",
+                (batch_key, rule_version)).fetchone()
+            if running is not None and (running["claimed_at"] or "") >= stale_before:
+                return {"claimed": False, "reason": "running",
+                        "batch": _batch_dict(running)}
+            target = running["batch_id"] if running is not None else None
+            resumed = running is not None
+            if target is None and preferred_id:
+                candidate = conn.execute("SELECT * FROM batches WHERE batch_id=?",
+                                         (preferred_id,)).fetchone()
+                if candidate is not None:
+                    target = candidate["batch_id"]
+                    resumed = True
+            if target is None:
+                # 同键同版本有失败批次：直接接续它，不为同一份输入留两条批次
+                failed = conn.execute(
+                    "SELECT * FROM batches WHERE batch_key=? AND rule_version=? "
+                    "AND status='failed' ORDER BY created_at DESC, rowid DESC LIMIT 1",
+                    (batch_key, rule_version)).fetchone()
+                if failed is not None:
+                    target = failed["batch_id"]
+                    resumed = True
+            if target is None:
+                target = candidate_id
+            exists = conn.execute("SELECT * FROM batches WHERE batch_id=?",
+                                  (target,)).fetchone()
+            if exists is not None:
+                conn.execute(
+                    """UPDATE batches SET status='running', claim_token=?, claimed_at=?,
+                           run_id=?, finished_at=NULL, error='', attempts=attempts+1,
+                           params_json=?, eval_date=?, input_digest=?, source=?,
+                           batch_key=?, rule_version=?, resume_of=COALESCE(NULLIF(
+                               resume_of,''), ?)
+                       WHERE batch_id=?""",
+                    (claim_token, now, run_id, params_json, eval_date, input_digest,
+                     source, batch_key, rule_version, resume_of, target))
+                attempt = int(exists["attempts"] or 0) + 1
+            else:
+                conn.execute(
+                    """INSERT INTO batches (batch_id,batch_key,run_id,source,status,
+                            rule_version,created_at,finished_at,input_digest,resume_of,
+                            params_json,note,eval_date,error,claim_token,claimed_at,attempts)
+                       VALUES (?,?,?,?,'running',?,?,NULL,?,?,?,?,?,'',?,?,1)""",
+                    (target, batch_key, run_id, source, rule_version, created_at,
+                     input_digest, resume_of, params_json, note, eval_date,
+                     claim_token, now))
+                attempt = 1
+            self._store_inputs(conn, target, inputs, now)
+            return {"claimed": True, "batch_id": target, "resumed": resumed,
+                    "attempt": attempt}
+
+    def find_failed_by_key(self, batch_key: str, rule_version: str) -> dict | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM batches WHERE batch_key=? AND rule_version=? "
+                "AND status='failed' ORDER BY created_at DESC, rowid DESC LIMIT 1",
+                (batch_key, rule_version)).fetchone()
+        return _batch_dict(row) if row else None
+
+    def fail_run(self, batch_id: str, claim_token: str, error: str,
+                 finished_at: str) -> None:
+        """失败尝试：保住留存原件，标记失败，结果表保持为空。"""
+        with self.connect() as conn:
+            conn.execute(
+                """UPDATE batches SET status='failed', error=?, finished_at=?,
+                       claim_token=NULL
+                   WHERE batch_id=? AND status='running' AND claim_token=?""",
+                (error, finished_at, batch_id, claim_token))
+
     # ---------------- 一次运行的原子写入 ----------------
     def save_run(self, *, batch: dict, files: list[dict], po_lines: list[dict],
                  grn_lines: list[dict], inv_lines: list[dict], quarantine: list[dict],
                  matches: list[dict], adjustments: list[dict], stages: list[dict],
-                 totals: dict, manifest: dict) -> None:
+                 totals: dict, manifest: dict, claim_token: str | None = None) -> None:
+        """结果与 done 状态同一事务提交；未完成时任何结果都不可见。"""
+        from . import errors
+
         batch_id = batch["batch_id"]
         with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            current = conn.execute(
+                "SELECT status, claim_token FROM batches WHERE batch_id=?",
+                (batch_id,)).fetchone()
+            if current is None:
+                raise errors.Conflict(f"批次已被移除：{batch_id}", code="E_CLAIM_LOST")
+            if claim_token and (current["status"] != "running"
+                                or current["claim_token"] != claim_token):
+                raise errors.Conflict(
+                    f"批次 {batch_id} 的执行权已失效，拒绝写入未授权结果",
+                    code="E_CLAIM_LOST")
             for table in ("files", "po_lines", "grn_lines", "inv_lines", "quarantine",
                           "matches", "adjustments", "stages", "totals"):
                 conn.execute(f"DELETE FROM {table} WHERE batch_id=?", (batch_id,))
@@ -269,54 +448,16 @@ class Store:
                 "ON CONFLICT(batch_id) DO UPDATE SET json=excluded.json",
                 (batch_id, json.dumps(manifest, ensure_ascii=False)))
             conn.execute(
-                """INSERT INTO batches (batch_id,batch_key,run_id,source,status,rule_version,
-                        created_at,finished_at,input_digest,resume_of,params_json,note)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
-                   ON CONFLICT(batch_id) DO UPDATE SET
-                     status=excluded.status, finished_at=excluded.finished_at,
-                     input_digest=excluded.input_digest, note=excluded.note""",
-                (batch_id, batch["batch_key"], batch["run_id"], batch["source"],
-                 batch["status"], batch["rule_version"], batch["created_at"],
-                 batch.get("finished_at"), batch["input_digest"], batch.get("resume_of"),
+                """UPDATE batches SET status=?, finished_at=?, input_digest=?,
+                       resume_of=?, params_json=?, note=?, eval_date=?, error='',
+                       claim_token=NULL, claimed_at=NULL, source=?, batch_key=?
+                   WHERE batch_id=?""",
+                (batch["status"], batch.get("finished_at"), batch["input_digest"],
+                 batch.get("resume_of"),
                  json.dumps(batch.get("params", {}), ensure_ascii=False),
-                 batch.get("note", "")))
-
-    def save_attempt(self, *, batch: dict, files: list[dict], stages: list[dict],
-                     note: str = "") -> None:
-        """失败尝试：只写批次、文件与阶段，不动任何已完成的批次数据。"""
-        batch_id = batch["batch_id"]
-        with self.connect() as conn:
-            conn.execute(
-                """INSERT INTO batches (batch_id,batch_key,run_id,source,status,rule_version,
-                        created_at,finished_at,input_digest,resume_of,params_json,note)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
-                   ON CONFLICT(batch_id) DO UPDATE SET status=excluded.status,
-                     finished_at=excluded.finished_at, note=excluded.note""",
-                (batch_id, batch["batch_key"], batch["run_id"], batch["source"],
-                 batch["status"], batch["rule_version"], batch["created_at"],
-                 batch.get("finished_at"), batch["input_digest"], batch.get("resume_of"),
-                 json.dumps(batch.get("params", {}), ensure_ascii=False),
-                 note or batch.get("note", "")))
-            conn.execute("DELETE FROM files WHERE batch_id=?", (batch_id,))
-            conn.execute("DELETE FROM stages WHERE batch_id=?", (batch_id,))
-            for f in files:
-                conn.execute(
-                    """INSERT INTO files (batch_id,name,doc_type,status,encoding,
-                        declared_charset,bom_stripped,bytes,sha256,record_count,
-                        segment_count,accept_count,quarantine_count,code,note)
-                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                    (batch_id, f["name"], f["doc_type"], f["status"], f.get("encoding"),
-                     f.get("declared_charset"), 1 if f.get("bom_stripped") else 0,
-                     f.get("bytes"), f.get("sha256"), f.get("record_count", 0),
-                     f.get("segment_count", 1), f.get("accept_count", 0),
-                     f.get("quarantine_count", 0), f.get("code"), f.get("note", "")))
-            for s in stages:
-                conn.execute(
-                    """INSERT INTO stages (batch_id,stage,in_count,out_count,
-                        quarantine_count,status,elapsed_ms,note)
-                       VALUES (?,?,?,?,?,?,?,?)""",
-                    (batch_id, s["stage"], s["in_count"], s["out_count"],
-                     s["quarantine_count"], s["status"], s["elapsed_ms"], s.get("note", "")))
+                 batch.get("note", ""),
+                 batch.get("eval_date") or "",
+                 batch["source"], batch["batch_key"], batch_id))
 
     # ---------------- 读取 ----------------
     def load_files(self, batch_id: str) -> list[dict]:

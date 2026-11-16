@@ -1,12 +1,19 @@
-"""M1 编排：读文件 → 解码 → 解析 → 列映射 → 逐行归一并诊断 → 跑完整条流水线。
+"""M1 编排：采信原件 → 留存 → 解码 → 解析 → 列映射 → 逐行归一并诊断 → 跑完整条流水线。
 
 一份文件里的一行只有两种结局：采纳，或带着稳定原因码进隔离区。
 文件级问题（编码回退、BOM、重复表头、末行截断）单独记在文件诊断上。
 流水线每阶段都产出 in/out/隔离三个数，页面上按阶段看得到行去了哪里。
+
+输入与批次绑定：
+- 新导入读当天文件字节，先算出摘要再领取批次，原件随批次落库；
+- 重算只读批次留存的原件与原评估日，源表被替换或移走都不影响结果；
+- 同一批次键并发领取只有一方拿到执行权，落账只发生一次。
 """
 from __future__ import annotations
 
+import datetime as dt
 import time
+import uuid
 from pathlib import Path
 
 from ... import config, errors, manifest, reasons
@@ -84,9 +91,15 @@ def _row_ref(name: str, record) -> str:
     return f"{name}:L{record.line_no}"
 
 
-def read_file(settings, entry: dict) -> dict:
-    path = Path(entry["path"])
-    raw = path.read_bytes()
+def read_bytes(entry: dict) -> bytes:
+    """读采信字节：entry 带 `bytes` 时用留存副本，否则读源文件。"""
+    if entry.get("bytes") is not None:
+        return entry["bytes"]
+    return Path(entry["path"]).read_bytes()
+
+
+def parse_bytes(entry: dict, raw: bytes) -> dict:
+    """对一段字节做解码、解析、归一并给出逐行诊断；不决定结果落到哪个批次。"""
     stats = {
         "name": entry["name"],
         "doc_type": entry["doc_type"],
@@ -231,28 +244,178 @@ def read_file(settings, entry: dict) -> dict:
             "counters": counters}
 
 
+def read_file(settings, entry: dict) -> dict:
+    """对单个文件做采信：源文件或留存副本都走同一条解析路径。"""
+    return parse_bytes(entry, read_bytes(entry))
+
+
+def _entry(name: str, doc_type: str, note: str = "", *, path: Path | None = None,
+           raw: bytes | None = None, source_path: str | None = None) -> dict:
+    entry = {"name": name, "doc_type": doc_type, "note": note}
+    if raw is None:
+        entry["path"] = str(path)
+        entry["bytes"] = Path(path).read_bytes()
+    else:
+        entry["bytes"] = raw
+        if path is not None:
+            entry["path"] = str(path)
+    entry["sha256"] = manifest.digest_bytes(entry["bytes"])
+    entry["source_path"] = source_path or entry.get("path")
+    return entry
+
+
+def resolve_files(settings, names: list[str] | None) -> list[dict]:
+    """从样例目录采信当天文件；读一次字节，摘要就以此为准。"""
+    base = Path(settings.sample_dir)
+    known = {entry["name"]: entry for entry in config.SAMPLE_FILES}
+    chosen = names or default_names()
+    if not chosen:
+        raise errors.BadRequest("没有可导入的文件", code="E_UNKNOWN_FILE")
+    out = []
+    for name in chosen:
+        entry = known.get(name)
+        path = base / name
+        if entry is None or not path.exists():
+            raise errors.BadRequest(f"文件不在样例清单内：{name}", code="E_UNKNOWN_FILE",
+                                    detail={"known": sorted(known)})
+        out.append(_entry(name, entry["doc_type"], entry["note"], path=path))
+    return out
+
+
+def resolve_saved(store, batch_id: str, *, require: bool = True) -> list[dict]:
+    """重算只认留存原件：源表被替换或移走也不影响。缺原件时明确拒绝。"""
+    saved = store.load_input_bytes(batch_id)
+    if not saved:
+        if not require:
+            return []
+        raise errors.Unsupported(
+            f"批次 {batch_id} 没有留存输入原件，拒绝重算；不从现有文件补造",
+            code="E_INPUT_MISSING",
+            detail={"batch_id": batch_id, "hint": "旧批次只保留结果，不能按当前文件重读"})
+    out = []
+    for item in saved:
+        out.append({"name": item["name"], "doc_type": item["doc_type"],
+                    "note": "", "bytes": item["bytes"], "sha256": item["sha256"],
+                    "source_path": item.get("source_path"),
+                    "stored_at": item.get("stored_at")})
+    return out
+
+
+def _claim_inputs(entries: list[dict]) -> list[dict]:
+    """领取时随批次落库的输入：文件名、单据类型、字节与来源指纹。"""
+    return [{"name": entry["name"], "doc_type": entry["doc_type"],
+             "bytes": entry["bytes"], "sha256": entry["sha256"],
+             "source_path": entry.get("source_path")} for entry in entries]
+
+
+def _prepare(*, entries: list[dict], store, settings, version: str, eval_date,
+             source: str, started_at: str, resume_of: str | None,
+             preferred_id: str | None, claim_token: str) -> dict:
+    """算批次键 → 查复用/陈旧 → 原子领取执行权。"""
+    # 指纹与文件顺序无关：同一组文件换顺序仍是同一批
+    input_digest = manifest.digest_parts(
+        sorted(f"{entry['name']}:{entry['sha256']}" for entry in entries))
+    batch_key = batch_state.batch_key(input_digest, eval_date)
+
+    existing = store.find_done_by_key(batch_key, version)
+    if existing is not None:
+        return {"reused": True, "batch": existing, "batch_key": batch_key,
+                "input_digest": input_digest}
+    batch_resume.assert_not_stale(store, batch_key=batch_key, rule_version=version)
+
+    claim = store.claim_run(
+        batch_key=batch_key, rule_version=version, eval_date=eval_date.isoformat(),
+        candidate_id=batch_state.new_batch_id(), preferred_id=preferred_id,
+        run_id=manifest.new_run_id(), source=source, created_at=started_at,
+        input_digest=input_digest, inputs=_claim_inputs(entries),
+        claim_token=claim_token, now=started_at,
+        stale_before=batch_state.lease_cutoff(settings), resume_of=resume_of,
+        params={"files": [entry["name"] for entry in entries],
+                "rule_version": version, "eval_date": eval_date.isoformat()},
+        note=f"采信 {len(entries)} 个文件")
+    if not claim["claimed"]:
+        if claim.get("reason") == "done" and claim.get("batch") is not None:
+            # 并发窗口内别人先完成了同一次运行：复用它的结果，不再落账
+            return {"reused": True, "batch": claim["batch"], "batch_key": batch_key,
+                    "input_digest": input_digest}
+        active = claim.get("batch") or {}
+        raise errors.Conflict(
+            f"批次键 {batch_key[:12]} 正在运行（批次 {active.get('batch_id')}），"
+            f"同一输入不重复落账",
+            code="E_BATCH_RUNNING",
+            detail={"batch_id": active.get("batch_id"), "status": active.get("status")})
+    return {"reused": False, "batch_key": batch_key, "input_digest": input_digest,
+            "batch_id": claim["batch_id"], "resumed": claim.get("resumed", False),
+            "attempt": claim.get("attempt", 1)}
+
+
 def run_import(*, settings, store, names: list[str] | None = None,
-               rule_version: str | None = None, resume_of: str | None = None) -> dict:
+               rule_version: str | None = None, resume_of: str | None = None,
+               input_batch_id: str | None = None) -> dict:
+    """导入/重跑统一入口。
+
+    - `input_batch_id` 指定时只读该批次留存的原件与评估日（历史重算）；
+    - 否则从样例目录采信当天文件（新导入）；
+    - `resume_of` 是失败重试：沿用来源批次的原件，不重新读源表。
+    """
     started = time.monotonic()
     started_at = _now()
-    resolved = resolve_files(settings, names)
     version = rule_version or settings.rule_version
 
-    # 指纹与文件顺序无关：同一组文件换顺序仍是同一批，重跑才幂等
-    digests = sorted((entry["name"], manifest.digest_file(entry["path"]))
-                     for entry in resolved)
-    input_digest = manifest.digest_parts([f"{n}:{d}" for n, d in digests])
-    batch_key = batch_state.batch_key(input_digest, settings.eval_date)
-    existing = store.latest_done_by_key(batch_key)
-    if existing is not None and existing["rule_version"] == version:
-        return {"batch": existing, "reused": True,
-                "stages": store.load_stages(existing["batch_id"]),
-                "counters": store.load_totals(existing["batch_id"])}
+    if input_batch_id:
+        source_batch = store.get_batch(input_batch_id)
+        if source_batch is None:
+            raise errors.NotFound(f"批次不存在：{input_batch_id}", code="E_BATCH_NOT_FOUND")
+        entries = resolve_saved(store, input_batch_id)
+        eval_date = batch_state.parse_eval_date(source_batch.get("eval_date")) \
+            or settings.eval_date
+        source = source_batch.get("source") or ",".join(e["name"] for e in entries)
+        preferred_id = None
+        resume_of = input_batch_id
+    elif resume_of:
+        source_batch = store.get_batch(resume_of)
+        if source_batch is None:
+            raise errors.NotFound(f"批次不存在：{resume_of}", code="E_BATCH_NOT_FOUND")
+        entries = resolve_saved(store, resume_of)
+        eval_date = batch_state.parse_eval_date(source_batch.get("eval_date")) \
+            or settings.eval_date
+        source = source_batch.get("source") or ",".join(e["name"] for e in entries)
+        preferred_id = resume_of
+    else:
+        entries = resolve_files(settings, names)
+        eval_date = settings.eval_date
+        source = ",".join(entry["name"] for entry in entries)
+        preferred_id = None
 
-    batch_resume.assert_not_stale(store, batch_key=batch_key, rule_version=version)
-    batch_id = batch_state.new_batch_id()
+    claim_token = uuid.uuid4().hex
+    prepared = _prepare(entries=entries, store=store, settings=settings, version=version,
+                        eval_date=eval_date, source=source, started_at=started_at,
+                        resume_of=resume_of, preferred_id=preferred_id,
+                        claim_token=claim_token)
+    if prepared["reused"]:
+        return {"batch": prepared["batch"], "reused": True,
+                "stages": store.load_stages(prepared["batch"]["batch_id"]),
+                "counters": store.load_totals(prepared["batch"]["batch_id"])}
+
+    batch_id = prepared["batch_id"]
     run_id = manifest.new_run_id()
+    input_digest = prepared["input_digest"]
+    batch_key = prepared["batch_key"]
+    try:
+        return _execute(settings=settings, store=store, entries=entries,
+                        batch_id=batch_id, run_id=run_id, batch_key=batch_key,
+                        input_digest=input_digest, version=version,
+                        eval_date=eval_date, source=source, started_at=started_at,
+                        resume_of=resume_of, claim_token=claim_token,
+                        started=started, replayed=bool(prepared.get("resumed")))
+    except Exception as exc:
+        store.fail_run(batch_id, claim_token, _error_text(exc), _now())
+        raise
 
+
+def _execute(*, settings, store, entries, batch_id, run_id, batch_key, input_digest,
+             version, eval_date, source, started_at, resume_of, claim_token,
+             started, replayed) -> dict:
     stage_rows = []
     files = []
     all_rows = {"po": [], "grn": [], "inv": []}
@@ -261,8 +424,9 @@ def run_import(*, settings, store, names: list[str] | None = None,
     ingest_in = 0
     ingest_out = 0
     ingest_bad = 0
-    for entry in resolved:
-        result = read_file(settings, entry)
+    for entry in entries:
+        result = parse_bytes(entry, entry["bytes"])
+        result["stats"]["source_path"] = entry.get("source_path")
         files.append(result["stats"])
         for doc_type in config.DOC_TYPES:
             all_rows[doc_type].extend(result["rows"][doc_type])
@@ -357,35 +521,50 @@ def run_import(*, settings, store, names: list[str] | None = None,
 
     elapsed_ms = int((time.monotonic() - started) * 1000)
     finished_at = _now()
+    names = [entry["name"] for entry in entries]
     manifest_payload = manifest.build(
         run_id=run_id, batch_id=batch_id, batch_key=batch_key, settings=settings,
         files=files, input_digest=input_digest,
-        params={"files": [entry["name"] for entry in resolved],
-                "rule_version": version},
+        params={"files": names, "rule_version": version,
+                "eval_date": eval_date.isoformat()},
         started_at=started_at, finished_at=finished_at, elapsed_ms=elapsed_ms,
         stages=stage_rows, counters=totals, totals=totals)
+    manifest_payload["inputs"] = [
+        {**item, "source_path": entry.get("source_path")}
+        for item, entry in zip(manifest_payload["inputs"], entries)]
+    manifest_payload["eval_date"] = eval_date.isoformat()
+    manifest_payload["rule_version"] = version
+    manifest_payload["replayed"] = replayed
     batch = {
         "batch_id": batch_id,
         "batch_key": batch_key,
         "run_id": run_id,
-        "source": ",".join(entry["name"] for entry in resolved),
+        "source": source,
         "status": "done",
         "rule_version": version,
         "created_at": started_at,
         "finished_at": finished_at,
         "input_digest": input_digest,
         "resume_of": resume_of,
-        "params": {"files": [entry["name"] for entry in resolved]},
+        "eval_date": eval_date.isoformat(),
+        "params": {"files": names, "rule_version": version,
+                   "eval_date": eval_date.isoformat()},
         "note": f"{counters['accepted']} 采纳 / {len(quarantine_rows)} 隔离",
     }
     store.save_run(batch=batch, files=files, po_lines=all_rows["po"],
                    grn_lines=all_rows["grn"], inv_lines=all_rows["inv"],
                    quarantine=quarantine_rows, matches=matches,
                    adjustments=adjustments, stages=stage_rows, totals=totals,
-                   manifest=manifest_payload)
+                   manifest=manifest_payload, claim_token=claim_token)
     return {"batch": batch, "reused": False, "stages": stage_rows,
             "counters": totals, "quality": quality_metrics.summary(files, quarantine_rows),
-            "reconcile": accounts, "adjust": adj_summary}
+            "reconcile": accounts, "adjust": adj_summary, "replayed": replayed}
+
+
+def _error_text(exc: Exception) -> str:
+    code = getattr(exc, "code", "")
+    text = getattr(exc, "message", None) or str(exc)
+    return f"{code}: {text}" if code else text
 
 
 def _drop(by_name: dict, row_ref: str, level: str = reasons.ERROR) -> None:
@@ -419,6 +598,7 @@ def batch_detail(store, batch_id: str) -> dict:
         raise errors.NotFound(f"批次不存在：{batch_id}", code="E_BATCH_NOT_FOUND")
     files = store.load_files(batch_id)
     quarantine_rows = store.load_quarantine(batch_id)
+    inputs = store.list_inputs(batch_id)
     return {
         "batch": batch,
         "files": files,
@@ -428,4 +608,24 @@ def batch_detail(store, batch_id: str) -> dict:
         "quality": quality_metrics.summary(files, quarantine_rows),
         "totals": store.load_totals(batch_id),
         "manifest": store.load_manifest(batch_id),
+        "inputs": inputs,
+        "input_check": input_check(batch, inputs),
+    }
+
+
+def input_check(batch: dict, inputs: list[dict]) -> dict:
+    """批次页核对输入依据：留存有原件、摘要与清单一致、评估日锁定。"""
+    digest = manifest.digest_parts(
+        sorted(f"{item['name']}:{item['sha256']}" for item in inputs))
+    declared = (batch.get("input_digest") or "")
+    return {
+        "count": len(inputs),
+        "total_bytes": sum(int(item.get("bytes") or 0) for item in inputs),
+        "retained": bool(inputs),
+        "digest": digest,
+        "stored_digest": declared,
+        "digest_match": bool(inputs) and digest == declared,
+        "eval_date": batch.get("eval_date") or "",
+        "source": batch.get("source") or "",
+        "replayable": bool(inputs),
     }

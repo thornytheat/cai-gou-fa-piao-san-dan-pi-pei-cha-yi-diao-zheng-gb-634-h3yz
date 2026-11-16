@@ -145,6 +145,8 @@ class Settings:
     export_dir: str = str(PROJECT_ROOT / "var" / "export")
     rule_version: str = RULE_VERSION
     eval_date: dt.date = dt.date(2026, 11, 15)
+    # running 租约秒数：过期视为进程中断，可接续重跑；租约内并发请求不重复落账
+    lease_seconds: int = 900
 
     @classmethod
     def from_env(cls) -> "Settings":

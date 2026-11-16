@@ -5,7 +5,8 @@
 <section class="panel">
   <div class="panel-head">
     <h2>批次历史</h2>
-    <span class="sub">{{ summary.batches }} 个批次 · 记录 {{ summary.records }} 行</span>
+    <span class="sub">{{ summary.batches }} 个批次 · 记录 {{ summary.records }} 行 ·
+      留存原件 {{ summary.replayable }} 批</span>
   </div>
   <div class="toolbar">
     <span class="hintline">水位 {{ summary.watermark.batch_id or '—' }}</span>
@@ -14,17 +15,18 @@
   <div class="scroll-x">
     <table class="grid" id="batch-table">
       <thead>
-        <tr><th>批次号</th><th>键</th><th>状态</th><th>规则</th><th>记录</th><th>采纳</th>
+        <tr><th>批次号</th><th>键</th><th>状态</th><th>规则</th><th>评估日</th><th>记录</th><th>采纳</th>
             <th>隔离</th><th>匹配</th><th>差异</th><th>缺单</th><th>调整额</th>
-            <th>输入摘要</th><th>完成</th><th>操作</th></tr>
+            <th>输入摘要</th><th>原件</th><th>完成</th><th>操作</th></tr>
       </thead>
       <tbody>
         {% for row in rows %}
         <tr>
-          <td class="mono">{{ row.batch_id }}</td>
+          <td class="mono"><a href="/batches?batch_id={{ row.batch_id }}">{{ row.batch_id }}</a></td>
           <td class="mono faint">{{ row.batch_key }}</td>
           <td><span class="tag {{ 'ok' if row.status == 'done' else 'warn' }}">{{ row.status|status }}</span></td>
           <td class="mono">{{ row.rule_version }}</td>
+          <td class="mono">{{ row.eval_date }}</td>
           <td class="num">{{ row.records }}</td>
           <td class="num">{{ row.accepted }}</td>
           <td class="num">{{ row.quarantined }}</td>
@@ -33,10 +35,21 @@
           <td class="num">{{ row.missing }}</td>
           <td class="num">{{ row.adjust_total }}</td>
           <td class="mono faint">{{ row.input_digest }}</td>
+          <td class="mono {{ 'pos' if row.replayable else 'neg' }}">
+            {{ row.input_count }} 份 / {{ row.input_bytes }} B</td>
           <td class="mono">{{ row.finished_at|stamp }}</td>
           <td>
+            {% if row.replayable and row.status == 'done' %}
             <button class="btn ghost rerun" data-batch="{{ row.batch_id }}"
-                    data-url="/api/batches/{{ row.batch_id }}/rerun">重跑</button>
+                    data-url="/api/batches/{{ row.batch_id }}/rerun">重算</button>
+            {% endif %}
+            {% if row.status == 'failed' %}
+            <button class="btn ghost retry" data-batch="{{ row.batch_id }}"
+                    data-url="/api/batches/{{ row.batch_id }}/retry">重试</button>
+            {% endif %}
+            {% if not row.replayable %}
+            <span class="tag bad" title="没有留存原件，拒绝重算">缺原件</span>
+            {% endif %}
           </td>
         </tr>
         {% endfor %}
@@ -44,6 +57,62 @@
     </table>
   </div>
 </section>
+
+{% if selected %}
+{% set check = selected.input_check %}
+<section class="panel">
+  <div class="panel-head">
+    <h2>输入依据 · {{ selected.batch.batch_id }}</h2>
+    <span class="sub">
+      评估日 {{ check.eval_date or '—' }} ·
+      {% if check.retained %}
+        <span class="tag {{ 'ok' if check.digest_match else 'bad' }}">
+          摘要{{ '一致' if check.digest_match else '不一致' }}</span>
+      {% else %}
+        <span class="tag bad">未留存原件</span>
+      {% endif %}
+    </span>
+  </div>
+  <div class="toolbar">
+    <span class="hintline">
+      留存 {{ check.count }} 份 / {{ check.total_bytes }} 字节 ·
+      来源 {{ check.source or '—' }} ·
+      {% if check.replayable %}可按住原件重算{% else %}不可重算：缺少原件{% endif %}
+    </span>
+    {% if selected_recovery and selected_recovery.resumable %}
+    <button class="btn ghost rerun" data-batch="{{ selected.batch.batch_id }}"
+            data-url="/api/batches/{{ selected.batch.batch_id }}/rerun">接续重跑</button>
+    {% endif %}
+    <span class="toast" id="detail-status" role="status"></span>
+  </div>
+  {% if check.retained %}
+  <div class="scroll-x">
+    <table class="grid">
+      <thead>
+        <tr><th>文件</th><th>单据</th><th>字节</th><th>摘要（留存）</th><th>来源路径</th><th>留存时间</th></tr>
+      </thead>
+      <tbody>
+        {% for item in selected.inputs %}
+        <tr>
+          <td class="mono">{{ item.name }}</td>
+          <td>{{ item.doc_type|doc }}</td>
+          <td class="num">{{ item.bytes }}</td>
+          <td class="mono">{{ item.sha256 }}</td>
+          <td class="mono faint">{{ item.source_path or '—' }}</td>
+          <td class="mono">{{ item.stored_at|stamp }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+  <p class="empty">该批次生成于输入留存之前，只保留计算结果；重算会被明确拒绝，不从现有文件补造。</p>
+  {% endif %}
+  {% if selected.batch.status == 'failed' and selected.batch.error %}
+  <p class="hintline neg">失败原因：{{ selected.batch.error }}</p>
+  {% endif %}
+</section>
+{% endif %}
 
 <section class="panel">
   <div class="panel-head"><h2>阶段顺序</h2><span class="sub">{{ summary.versions|join(' ') }}</span></div>

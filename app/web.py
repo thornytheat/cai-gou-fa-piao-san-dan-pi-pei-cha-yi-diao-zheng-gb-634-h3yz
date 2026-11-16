@@ -39,7 +39,6 @@ STATUS_LABELS = {
     "ready": "就绪",
 }
 
-
 router = APIRouter()
 
 
@@ -286,8 +285,17 @@ def page_batches(request: Request, batch_id: str | None = None):
     ctx = get_ctx(request)
     batch = ctx.current_batch(batch_id)
     payload = batch_service.list_payload(ctx.store, ctx.settings, limit=30)
+    selected = None
+    if batch_id:
+        selected = batch_service.detail(ctx.store, batch_id)
+    elif batch is not None:
+        selected = batch_service.detail(ctx.store, batch["batch_id"])
     data = {"active": "batches", "batch_id": batch_id,
-            "rows": payload["rows"], "summary": payload["summary"]}
+            "rows": payload["rows"], "summary": payload["summary"],
+            "selected": selected,
+            "selected_recovery": (batch_service.recovery(ctx.store, ctx.settings,
+                                                         batch_id)
+                                  if batch_id else None)}
     data.update(_guard(ctx.store, batch))
     return render(request, "batches.html", **data)
 

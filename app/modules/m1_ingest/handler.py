@@ -32,11 +32,15 @@ def post_import(request: Request, body: ImportBody | None = None) -> dict:
         raise errors.BadRequest("files 不能是空数组", code="E_UNKNOWN_FILE")
     result = service.run_import(settings=settings, store=store, names=payload.files,
                                rule_version=payload.rule_version)
+    batch = result["batch"]
+    inputs = store.list_inputs(batch["batch_id"])
     return {
-        "batch_id": result["batch"]["batch_id"],
-        "run_id": result["batch"]["run_id"],
+        "batch_id": batch["batch_id"],
+        "run_id": batch["run_id"],
         "reused": result["reused"],
-        "status": result["batch"]["status"],
+        "status": batch["status"],
+        "eval_date": batch.get("eval_date") or "",
+        "input_check": service.input_check(batch, inputs),
         "counters": result["counters"],
         "stages": result["stages"],
         "quality": result.get("quality"),
@@ -52,9 +56,12 @@ def get_files(request: Request, batch_id: str | None = None) -> dict:
     if batch is None:
         raise errors.NotFound("还没有运行过批次", code="E_BATCH_NOT_FOUND")
     files = store.load_files(batch["batch_id"])
+    inputs = store.list_inputs(batch["batch_id"])
     return {
         "batch_id": batch["batch_id"],
         "files": files,
+        "inputs": inputs,
+        "input_check": service.input_check(batch, inputs),
         "stages": store.load_stages(batch["batch_id"]),
         "counters": store.load_totals(batch["batch_id"]),
     }

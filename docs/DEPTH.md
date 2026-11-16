@@ -1,6 +1,6 @@
 # 深度登记 invoice3way（采购发票三单匹配与差异调整）
 
-- 规模：中型（7 个功能模块 / 7 个页面 / 93 条测试函数，pytest 96 条用例）
+- 规模：中型（7 个功能模块 / 7 个页面 / 109 条测试函数，pytest 112 条用例）
 - 核心规则一：**三单匹配**——按 `(采购单号, 行号)` 把采购订单、入库单、发票分组，命中规则全部收集后按固定优先级（缺单 > 税额差 > 价差 > 量差）取结论，判定结果不随规则书写顺序变化。
 - 核心规则二：**差异归因与尾差**——差异拆成量差 / 价差 / 税额差三类金额，调整单按采购单的发票不含税金额加权，用最大余额法分摊到分，分摊合计严格等于差异总额。
 - 核心规则三：**复核台账**——跨批次重复报销按「同号不同额 / 同号同额 / 同额不同号」三类报；红字行不参与匹配但进供应商汇总做冲减；分批入库按批相加；发票税率与采购单不同按发票税率重算应付。
@@ -14,7 +14,7 @@
 | M2 金额税率 | 查列契约，单格试算归一结果 | GET /api/contract、GET /api/contract/preview | `app/modules/m2_amount/handler.py` `app/modules/m2_amount/service.py` `app/modules/m2_amount/contract.py` `app/modules/m2_amount/coerce.py` `app/modules/m2_amount/taxmath.py` | `tests/test_amount.py` |
 | M3 质量隔离 | 看原因码分布、逐行证据、导出隔离 CSV | GET /api/quarantine、页面 / | `app/modules/m3_quality/handler.py` `app/modules/m3_quality/service.py` `app/modules/m3_quality/rules.py` `app/modules/m3_quality/quarantine.py` `app/modules/m3_quality/metrics.py` | `tests/test_quality.py` |
 | M4 三单匹配 | 左右分栏看三单对照、差异明细与四账 | GET /api/trios、GET /api/matches、GET /api/diffs、GET /api/reconcile | `app/modules/m4_match/handler.py` `app/modules/m4_match/service.py` `app/modules/m4_match/compare.py` `app/modules/m4_match/diffattr.py` `app/modules/m4_match/reconcile.py` | `tests/test_match.py` |
-| M5 批次重跑 | 查历史、幂等重跑、旧版本提交被拒 | GET /api/batches、POST /api/batches/{id}/rerun | `app/modules/m5_batches/handler.py` `app/modules/m5_batches/service.py` `app/modules/m5_batches/state.py` `app/modules/m5_batches/resume.py` `app/modules/m5_batches/history.py` | `tests/test_batches.py` |
+| M5 批次重跑 | 查历史、核对输入依据、按留存原件重算、失败重试 | GET /api/batches、POST /api/batches/{id}/rerun、POST /api/batches/{id}/retry | `app/modules/m5_batches/handler.py` `app/modules/m5_batches/service.py` `app/modules/m5_batches/state.py` `app/modules/m5_batches/resume.py` `app/modules/m5_batches/history.py` | `tests/test_batches.py` `tests/test_batch_inputs.py` |
 | M6 调整单导出 | 看调整单与守恒数，下载 CSV / 清单 | GET /api/export、GET /api/export/download | `app/modules/m6_export/handler.py` `app/modules/m6_export/service.py` `app/modules/m6_export/adj.py` `app/modules/m6_export/csv_out.py` `app/modules/m6_export/manifest_out.py` | `tests/test_export.py` |
 | M7 复核台账 | 看跨批次重复组、红字冲减与供应商汇总 | GET /api/audit、GET /api/audit/dups、GET /api/audit/vendors、页面 /audit | `app/modules/m7_audit/handler.py` `app/modules/m7_audit/service.py` `app/modules/m7_audit/dups.py` `app/modules/m7_audit/redline.py` `app/modules/m7_audit/rollup.py` | `tests/test_audit_dups.py` `tests/test_audit_redline.py` `tests/test_audit_vendors.py` |
 
@@ -39,6 +39,11 @@
 | TRAP-26 | 旧规则版本提交覆盖新批次 | 无条件覆盖，历史数据被改写 | 批次键只认输入摘要 + 评估日；版本更旧的提交 409 拒绝 | `app/modules/m5_batches/resume.py` | `tests/test_batches.py::test_stale_commit_rejected` |
 | TRAP-27 | 红字发票（负数行）只在汇总里出现 | 汇总只加正数发票，净额虚高；或把红字取绝对值当增加 | 红字不进匹配键；按「已冲抵 / 未冲抵」分流，已冲抵进净额、未冲抵挂待确认，超额单独计数 | `app/modules/m7_audit/redline.py`、`app/modules/m7_audit/rollup.py` | `tests/test_audit_redline.py::test_red_total_reduces_supplier_net` |
 | TRAP-28 | 一个采购行分三批入库（40 + 18 + 2） | 只取最后一批或最大一批，未入库数量与超收判断都错 | 按入库日期 + 单号排序逐批列出，实收 = 各批相加，未入库 = 订单数量 − 实收 | `app/modules/m7_audit/rollup.py` | `tests/test_audit_vendors.py::test_grn_multi_batch_sum_conserves` |
+| TRAP-29 | 源表每天更新，历史批次重跑却按文件名重新读 | 重算读到当天更正件，把更正件冒充原始凭证，历史结果被悄悄改写 | 采信时原件字节随批次落库（`batch_inputs`）；重算、重试只读留存副本与原评估日 | `app/store.py`、`app/modules/m1_ingest/service.py`、`app/modules/m5_batches/service.py` | `tests/test_batch_inputs.py::test_rerun_uses_retained_original_after_source_replaced` |
+| TRAP-30 | 源表采信后被替换或移走 | 重算报文件不存在，或按新文件算出另一个结果 | 原件的字节、sha256、来源路径都留存，源表与重算解耦 | 同上 | `tests/test_batch_inputs.py::test_rerun_survives_source_removed` |
+| TRAP-31 | 两个并发请求同时导入同一份文件 | 各建一个批次、各落一次账，同一输入出现两份结果 | 事务内原子领取：先查 done、再查 running 租约；只有一方拿到 claim_token 能写库 | `app/store.py::claim_run` | `tests/test_batch_inputs.py::test_parallel_imports_write_one_batch`、`test_concurrent_claim_writes_once` |
+| TRAP-32 | 输入已留存、结果写到一半进程中断 | 半批数据可见，或重跑重新读源表拿到更正件 | 结果与 done 状态同一事务提交；失败/中断批次只留原件，结果表为空；租约过期可接续 | `app/store.py::save_run`、`app/modules/m5_batches/resume.py` | `tests/test_batch_inputs.py::test_interrupted_run_is_invisible_and_recoverable` |
+| TRAP-33 | 输入留存上线前的旧批次点重算 | 按当前文件补造一份「原件」，历史凭证被伪造 | 缺留存原件的批次 422 `E_INPUT_MISSING`，明确拒绝，不读现有文件 | `app/modules/m5_batches/resume.py::assert_inputs_saved` | `tests/test_batch_inputs.py::test_missing_inputs_rejected_without_backfill` |
 
 ## 对账规则
 
@@ -48,6 +53,22 @@
 - 隔离账：隔离行数（11）= 原因码分布合计（11）
 - 四账在 `GET /api/reconcile`、`/export` 页面与 `reconcile.json` 导出中显示，差额非 0 会显式为「四账不平」
 - 调整账：调整单合计（241.28）= 已分摊（241.28）+ 尾差（0.00）
+
+## 输入留存与批次绑定（M5）
+
+- 留存：采信时把每份文件的原始字节、`sha256`、来源路径、留存时间与次序写进 `batch_inputs`，
+  与批次行同一事务提交；批次页「输入依据」展示这些字段，并核对留存摘要与 `input_digest` 是否一致。
+- 分层：**新导入**按文件名读当天文件；**重算**只读指定批次的留存原件与原评估日；
+  **失败重试**只读失败批次自己的留存原件。三者共用同一流水线，区别只在输入来源。
+- 更正件：新导入读到更正件时摘要变化 → 批次键变化 → 新批次；旧批次的原件、评估日与结果都不动，
+  所以更正件不会冒充原始凭证。
+- 评估日：批次创建时写入 `eval_date`；重算沿用原值，换评估日只有新导入才会产生另一个批次键。
+- 并发：`claim_run` 在 `BEGIN IMMEDIATE` 里先查同键同版本 done（有则复用）、再查 running；
+  租约内（默认 900s）的 running 一律拒绝（`E_BATCH_RUNNING`），落账只发生一次；
+  写库时校验 `claim_token`，执行权被接管则 `E_CLAIM_LOST`。
+- 中断恢复：结果表与 `done` 状态同一事务提交，未完成批次任何页面/接口都取不到结果；
+  租约过期的 running 视为进程中断，可按留存原件接续同一批次号，`attempts` 递增。
+- 缺原件：`batch_inputs` 为空的旧批次重算返回 422 `E_INPUT_MISSING`，不读当前文件补造。
 
 ## 复核规则（M7）
 
@@ -64,7 +85,7 @@
 ## 反例与不变量
 
 - 反例（朴素实现会挂）：`tests/test_amount.py::test_decimal_sum_has_no_float_error`（float 累加 1000 行 0.07 得不到 70.00）、`tests/test_match.py::test_naive_first_hit_wins_would_flip`（先命中即结论会被规则顺序左右）、`tests/test_audit_redline.py::test_red_total_reduces_supplier_net`（只加正数会得 265550.00，冲减后是 252272.50）、`tests/test_audit_vendors.py::test_grn_multi_batch_sum_conserves`（只取最后一批得 2，按批相加得 60）。
-- 不变量：`tests/test_batches.py::test_idempotent_rerun_adds_no_rows`（幂等，重跑行数不变）、`tests/test_export.py::test_largest_remainder_conserves_total`（守恒，分摊合计等于总额）、`tests/test_match.py::test_four_accounts_balanced`（对账守恒）、`tests/test_audit_vendors.py::test_net_conserves_invoice_total`（Σ 供应商净额 = 发票合计 + 已冲抵红字）、`tests/test_audit_vendors.py::test_grn_multi_batch_sum_conserves`（分批入库各批相加守恒）。
+- 不变量：`tests/test_batches.py::test_idempotent_rerun_adds_no_rows`（幂等，重跑行数不变）、`tests/test_batch_inputs.py::test_parallel_imports_write_one_batch`（并发只落一次账）、`tests/test_batch_inputs.py::test_rerun_uses_retained_original_after_source_replaced`（重算只认原件）、`tests/test_export.py::test_largest_remainder_conserves_total`（守恒，分摊合计等于总额）、`tests/test_match.py::test_four_accounts_balanced`（对账守恒）、`tests/test_audit_vendors.py::test_net_conserves_invoice_total`（Σ 供应商净额 = 发票合计 + 已冲抵红字）、`tests/test_audit_vendors.py::test_grn_multi_batch_sum_conserves`（分批入库各批相加守恒）。
 - 边界：`tests/test_amount.py::test_rate_upper_bound_inclusive`（税率上界 0.5 含端点）、`tests/test_match.py::test_qty_tolerance_zero_boundary`（数量容差 0，差 0.0001 也算量差）、`tests/test_quality.py::test_three_rows_same_number_all_conflict`（同号三行全部进冲突）、`tests/test_batches.py::test_different_eval_date_creates_new_batch`（换评估日建新批次）。
 - 端到端：`tests/test_e2e.py::test_full_pipeline_end_to_end`。
 
@@ -77,5 +98,9 @@
 - 重复报销只比已完成批次（最多 20 个）里的发票行；跨库、外部报销系统、纸质单据不在范围内。
 - 三单匹配只支持「一采购行对多入库行、多发票行」的求和规则；一张发票跨多个采购单的分摊（票面拆分）不支持，遇到时按行号单独匹配，拆不开就缺单。
 - 同一发票号金额一致时只保留首行，不做去重后的数量取大取小裁定，理由写在 `docs/DATA-DICTIONARY.md` 的去重键一节。
-- 只做单机 SQLite 与串行导入；没有并发导入锁、限流与重试（内部 9 人使用场景下不需要）。
+- 只做单机 SQLite 与串行导入；并发保护是「同键同版本只落一次账」与租约接管，不是通用任务队列；
+  没有跨机分布式锁。9 人内部使用场景下足够。
+- 留存原件存在同一个 SQLite 文件里（base64）；样例文件很小，月均 1200 张发票量级够用。
+  若将来单批附件达到百 MB 级，需要改成外部对象存储 + 只存引用。
+- 中断恢复以租约（默认 900 秒）判定：进程若在租约内崩溃，需要等租约过期才能接续；这是有意的保守选择。
 - 样例文件固定在 `sample_data/`，不支持浏览器上传任意文件；导入入口只接受样例清单内的文件名。
